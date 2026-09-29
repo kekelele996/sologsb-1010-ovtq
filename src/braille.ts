@@ -6,6 +6,7 @@ import type {
   TextbookLine,
   TranscriptionRule,
 } from './types';
+import { normalizeProject, reconcileLayout } from './layout';
 
 const LETTERS: Record<string, string> = {
   a: '⠁', b: '⠃', c: '⠉', d: '⠙', e: '⠑', f: '⠋', g: '⠛', h: '⠓', i: '⠊', j: '⠚',
@@ -202,26 +203,29 @@ function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: T
   return { line: nextLine, issues };
 }
 
-export function analyzeProject(state: ProjectState): ProjectState {
-  const ruleSet = state.ruleSets.find((item) => item.id === state.activeRuleSetId) ?? state.ruleSets[0];
+export function analyzeProject(state: ProjectState, recheckLayout = true): ProjectState {
+  const normalized = normalizeProject(state);
+  const ruleSet = normalized.ruleSets.find((item) => item.id === normalized.activeRuleSetId) ?? normalized.ruleSets[0];
   const nextLines: TextbookLine[] = [];
   const issues: ProofIssue[] = [];
 
-  state.lines.forEach((line, index) => {
-    const previousSourceContinues = Boolean(state.lines[index - 1]?.source.trimEnd().endsWith('-'));
+  normalized.lines.forEach((line, index) => {
+    const previousSourceContinues = Boolean(normalized.lines[index - 1]?.source.trimEnd().endsWith('-'));
     const tokens = transcribeLine(line.source, ruleSet, previousSourceContinues);
-    const analyzed = analyzeLine({ ...line, tokens }, state.lines[index - 1]);
+    const analyzed = analyzeLine({ ...line, tokens }, normalized.lines[index - 1]);
     nextLines.push(analyzed.line);
     issues.push(...analyzed.issues);
   });
 
-  return {
-    ...state,
+  const analyzed: ProjectState = {
+    ...normalized,
     lines: nextLines,
     issues,
     lastCheckedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
+
+  return recheckLayout ? reconcileLayout(analyzed) : analyzed;
 }
 
 export function updateRuleInSet(ruleSet: RuleSet, ruleId: string, patch: Partial<TranscriptionRule>): RuleSet {

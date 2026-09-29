@@ -89,6 +89,9 @@ const base: ProjectState = {
   ],
   issues: [],
   versions: [],
+  layout: { cellsPerLine: 32, linesPerPage: 25 },
+  layoutOverrides: [],
+  layoutSignatures: {},
   lastCheckedAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
 };

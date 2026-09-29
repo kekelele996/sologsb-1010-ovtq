@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import { analyzeProject, brailleCellCount, makeRule, updateRuleInSet } from './braille';
+import { breakWindow, paginate, refreshLayoutSignatures } from './layout';
+import { buildPaginatedText, buildPrintHtml, LayoutPreview } from './layout-preview';
 import { createInitialProject } from './sample';
 import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
 
@@ -213,6 +215,7 @@ function RuleSetPanel({
 function LineCard({
   line,
   index,
+  total,
   selected,
   issues,
   onSelect,
@@ -220,9 +223,11 @@ function LineCard({
   onNote,
   onStatus,
   onDelete,
+  onMove,
 }: {
   line: TextbookLine;
   index: number;
+  total: number;
   selected: boolean;
   issues: ProofIssue[];
   onSelect: () => void;
@@ -230,6 +235,7 @@ function LineCard({
   onNote: (note: string) => void;
   onStatus: (status: TextbookLine['status']) => void;
   onDelete: () => void;
+  onMove: (direction: -1 | 1) => void;
 }) {
   const unresolved = issues.filter((issue) => !issue.resolved);
   const lineIssues = unresolved.filter((issue) => issue.lineId === line.id);
@@ -239,6 +245,10 @@ function LineCard({
       <div class="line-gutter">
         <span>{String(index + 1).padStart(2, '0')}</span>
         <span class={`line-status ${line.status}`} title={`状态：${line.status}`} />
+        <div class="line-order">
+          <button type="button" aria-label="上移一行" title="上移一行" disabled={index === 0} onClick={(event: MouseEvent) => { event.stopPropagation(); onMove(-1); }}>↑</button>
+          <button type="button" aria-label="下移一行" title="下移一行" disabled={index === total - 1} onClick={(event: MouseEvent) => { event.stopPropagation(); onMove(1); }}>↓</button>
+        </div>
       </div>
       <div class="line-body">
         <div class="line-source">
@@ -297,6 +307,7 @@ function EditorPanel({
   onNote,
   onStatus,
   onDelete,
+  onMoveLine,
   onAddLine,
   onSplitLongLines,
   onImport,
@@ -307,6 +318,7 @@ function EditorPanel({
   onNote: (id: string, note: string) => void;
   onStatus: (id: string, status: TextbookLine['status']) => void;
   onDelete: (id: string) => void;
+  onMoveLine: (id: string, direction: -1 | 1) => void;
   onAddLine: () => void;
   onSplitLongLines: () => void;
   onImport: (text: string) => void;
@@ -360,6 +372,7 @@ function EditorPanel({
             key={line.id}
             line={line}
             index={index}
+            total={state.lines.length}
             selected={state.selectedLineId === line.id}
             issues={state.issues}
             onSelect={() => onSelectLine(line.id)}
@@ -367,6 +380,7 @@ function EditorPanel({
             onNote={(note) => onNote(line.id, note)}
             onStatus={(status) => onStatus(line.id, status)}
             onDelete={() => onDelete(line.id)}
+            onMove={(direction) => onMoveLine(line.id, direction)}
           />
         ))}
       </div>
@@ -482,6 +496,7 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
   const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [view, setView] = useState<'proof' | 'layout'>('proof');
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
 
@@ -489,6 +504,70 @@ export default function App() {
   const unresolvedCount = state.issues.filter((issue) => !issue.resolved).length;
   const approvedCount = state.lines.filter((line) => line.status === 'approved').length;
   const progress = state.lines.length ? Math.round((approvedCount / state.lines.length) * 100) : 0;
+
+  const layout = useMemo(() => paginate(state.lines, state.layout, state.layoutOverrides), [state.lines, state.layout, state.layoutOverrides]);
+
+  const updateOverride = (lineId: string, patch: Partial<{ pageBreakBefore: boolean; breakCell: number }>) => {
+    commit('调整手工分页', (current) => {
+      const existing = current.layoutOverrides.find((item) => item.lineId === lineId);
+      const merged = { ...(existing ?? { lineId }), ...patch } as (typeof current.layoutOverrides)[number];
+      // 两个字段都没有有效值时移除整条例外
+      const isEmpty = !merged.pageBreakBefore && (merged.breakCell == null || Number.isNaN(merged.breakCell));
+      const layoutOverrides = isEmpty
+        ? current.layoutOverrides.filter((item) => item.lineId !== lineId)
+        : existing
+          ? current.layoutOverrides.map((item) => (item.lineId === lineId ? merged : item))
+          : [...current.layoutOverrides, merged];
+      return refreshLayoutSignatures({ ...current, layoutOverrides });
+    });
+  };
+
+  const togglePageBreak = (lineId: string) => {
+    const existing = state.layoutOverrides.find((item) => item.lineId === lineId);
+    updateOverride(lineId, { pageBreakBefore: !existing?.pageBreakBefore });
+  };
+
+  const nudgeBreak = (lineId: string, direction: -1 | 1) => {
+    const window = breakWindow(state.lines, state.layout, state.layoutOverrides, lineId);
+    if (!window) return;
+    // 从当前断点（无手工值时即自动断点）出发，沿格方向找最近一个几何上能形成跨页断点的位置
+    let candidate = window.current + direction;
+    for (let steps = 0; steps < state.layout.cellsPerLine * state.layout.linesPerPage && candidate >= window.min && candidate <= window.max; steps += 1) {
+      const probe = paginate(
+        state.lines,
+        state.layout,
+        [
+          ...state.layoutOverrides.filter((item) => item.lineId !== lineId),
+          { lineId, breakCell: candidate },
+        ],
+      );
+      const produced = probe.rows.find((row) => row.lineId === lineId && row.splitHyphenEnd);
+      if (produced && produced.endOffset === candidate) {
+        updateOverride(lineId, { breakCell: candidate });
+        return;
+      }
+      candidate += direction;
+    }
+  };
+
+  const clearBreak = (lineId: string) => {
+    commit('恢复自动断点', (current) => {
+      const layoutOverrides = current.layoutOverrides
+        .map((item) => (item.lineId === lineId ? { ...item, breakCell: undefined } : item))
+        .filter((item) => item.lineId !== lineId || item.pageBreakBefore);
+      return refreshLayoutSignatures({ ...current, layoutOverrides });
+    });
+  };
+
+  const changeLayout = (patch: Partial<typeof state.layout>) => {
+    commit('调整版面参数', (current) =>
+      refreshLayoutSignatures({ ...current, layout: { ...current.layout, ...patch } }));
+  };
+
+  const resetLayout = () => {
+    commit('恢复默认版面', (current) =>
+      refreshLayoutSignatures({ ...current, layout: { cellsPerLine: 32, linesPerPage: 25 } }));
+  };
 
   const selectLine = (lineId: string, scroll = false) => {
     commit('切换当前行', (current) => ({ ...current, selectedLineId: lineId }));
@@ -503,7 +582,21 @@ export default function App() {
     commit('更新校对状态', (current) => {
       const lines = current.lines.map((line) => line.id === lineId ? { ...line, status } : line);
       const issues = current.issues.map((item) => item.lineId === lineId && status === 'approved' ? { ...item, resolved: true } : item);
-      return { ...current, lines, issues, updatedAt: new Date().toISOString() };
+      // 批准即确认当前版面：以现状重建签名基线，后续原文/规则/行序再变才会再次回退
+      const next: ProjectState = { ...current, lines, issues, updatedAt: new Date().toISOString() };
+      return status === 'approved' ? refreshLayoutSignatures(next) : next;
+    });
+  };
+
+  const moveLine = (lineId: string, direction: -1 | 1) => {
+    commit('调整课文行序', (current) => {
+      const index = current.lines.findIndex((line) => line.id === lineId);
+      const target = index + direction;
+      if (index < 0 || target < 0 || target >= current.lines.length) return current;
+      const lines = [...current.lines];
+      [lines[index], lines[target]] = [lines[target], lines[index]];
+      // 行序变化后重算分页：位置改变的已批准行由 reconcileLayout 回退为待核对
+      return analyzeProject({ ...current, lines, selectedLineId: lineId });
     });
   };
 
@@ -564,11 +657,11 @@ export default function App() {
   };
 
   const exportText = () => {
-    const blob = new Blob([`${state.title}\n规则集：${activeRuleSet.name}\n\n${outputText(state)}\n`], { type: 'text/plain;charset=utf-8' });
+    const blob = new Blob([`${state.title}\n规则集：${activeRuleSet.name}\n\n${buildPaginatedText(state, layout)}\n`], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `${state.title.replace(/[^\p{L}\p{N}-]+/gu, '-')}-盲文.txt`;
+    anchor.download = `${state.title.replace(/[^\p{L}\p{N}-]+/gu, '-')}-分页盲文.txt`;
     anchor.click();
     URL.revokeObjectURL(url);
   };
@@ -576,10 +669,7 @@ export default function App() {
   const exportPrint = () => {
     const printWindow = window.open('', '_blank', 'width=900,height=1100');
     if (!printWindow) return;
-    const rows = state.lines.map((line, index) => `
-      <tr><td>${index + 1}</td><td>${line.source.replace(/[<>&]/g, (char) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[char] ?? char))}</td><td class="braille">${line.tokens.map((token) => token.braille).join('')}</td></tr>
-    `).join('');
-    printWindow.document.write(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${state.title}</title><style>body{font-family:Georgia,serif;color:#111;margin:36px}h1{font-size:22px}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #bbb;text-align:left;vertical-align:top}td:first-child{width:36px;color:#666}.braille{font-family:"Apple Braille",sans-serif;font-size:24px}@media print{body{margin:16mm}}</style></head><body><h1>${state.title}</h1><p>${state.author} · ${activeRuleSet.name} · ${new Date().toLocaleDateString('zh-CN')}</p><table><thead><tr><th>#</th><th>原文</th><th>盲文校对稿</th></tr></thead><tbody>${rows}</tbody></table><script>window.onload=()=>setTimeout(()=>window.print(),150)</script></body></html>`);
+    printWindow.document.write(buildPrintHtml(state, layout, activeRuleSet.name));
     printWindow.document.close();
   };
 
@@ -626,6 +716,10 @@ export default function App() {
           <small>上次自动保存 {formatTime(state.updatedAt)}</small>
         </div>
         <div class="topbar-actions">
+          <div class="view-switch" role="tablist" aria-label="工作台视图">
+            <button type="button" class={view === 'proof' ? 'active' : ''} onClick={() => setView('proof')}>逐行校对</button>
+            <button type="button" class={view === 'layout' ? 'active' : ''} onClick={() => setView('layout')}>排版预览</button>
+          </div>
           <md-icon-button onClick={undo} disabled={history.past.length === 0} aria-label="撤销" title="撤销 ⌘Z">↶</md-icon-button>
           <md-icon-button onClick={redo} disabled={history.future.length === 0} aria-label="重做" title="重做 ⇧⌘Z">↷</md-icon-button>
           <md-outlined-button onClick={exportText}>导出文本</md-outlined-button>
@@ -662,29 +756,45 @@ export default function App() {
           onRecheck={() => commit('重新检查全部内容', analyzeProject)}
         />
 
-        <EditorPanel
-          state={state}
-          onSelectLine={selectLine}
-          onChangeLine={changeLine}
-          onNote={(lineId, note) => commit('添加校对备注', (current) => ({ ...current, lines: current.lines.map((line) => line.id === lineId ? { ...line, note } : line) }))}
-          onStatus={changeStatus}
-          onDelete={(lineId) => commit('删除课文行', (current) => {
-            const lines = current.lines.filter((line) => line.id !== lineId);
-            return analyzeProject({ ...current, lines: lines.length ? lines : [{ id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false }], selectedLineId: lines[0]?.id ?? '' });
-          })}
-          onAddLine={() => commit('新增课文行', (current) => {
-            const line: TextbookLine = { id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false };
-            return analyzeProject({ ...current, lines: [...current.lines, line], selectedLineId: line.id });
-          })}
-          onSplitLongLines={() => commit('按句拆分长行', (current) => {
-            const lines = current.lines.flatMap((line) => line.source
-              .split(/(?<=[.!?。！？])\s+|;\s*/)
-              .filter((part) => part.trim())
-              .map((source, index) => ({ ...line, id: index === 0 ? line.id : `line-split-${Date.now()}-${index}`, source: source.trim(), tokens: [], note: index === 0 ? line.note : '' })));
-            return analyzeProject({ ...current, lines });
-          })}
-          onImport={importCourse}
-        />
+        {view === 'proof' ? (
+          <EditorPanel
+            state={state}
+            onSelectLine={selectLine}
+            onChangeLine={changeLine}
+            onNote={(lineId, note) => commit('添加校对备注', (current) => ({ ...current, lines: current.lines.map((line) => line.id === lineId ? { ...line, note } : line) }))}
+            onStatus={changeStatus}
+            onDelete={(lineId) => commit('删除课文行', (current) => {
+              const lines = current.lines.filter((line) => line.id !== lineId);
+              return analyzeProject({ ...current, lines: lines.length ? lines : [{ id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false }], selectedLineId: lines[0]?.id ?? '' });
+            })}
+            onMoveLine={moveLine}
+            onAddLine={() => commit('新增课文行', (current) => {
+              const line: TextbookLine = { id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false };
+              return analyzeProject({ ...current, lines: [...current.lines, line], selectedLineId: line.id });
+            })}
+            onSplitLongLines={() => commit('按句拆分长行', (current) => {
+              const lines = current.lines.flatMap((line) => line.source
+                .split(/(?<=[.!?。！？])\s+|;\s*/)
+                .filter((part) => part.trim())
+                .map((source, index) => ({ ...line, id: index === 0 ? line.id : `line-split-${Date.now()}-${index}`, source: source.trim(), tokens: [], note: index === 0 ? line.note : '' })));
+              return analyzeProject({ ...current, lines });
+            })}
+            onImport={importCourse}
+          />
+        ) : (
+          <main class="layout-panel" aria-label="排版预览与分页">
+            <LayoutPreview
+              state={state}
+              layout={layout}
+              onChangeLayout={changeLayout}
+              onResetLayout={resetLayout}
+              onSelectLine={(lineId) => { selectLine(lineId, false); setView('proof'); }}
+              onNudgeBreak={nudgeBreak}
+              onClearBreak={clearBreak}
+              onTogglePageBreak={togglePageBreak}
+            />
+          </main>
+        )}
 
         <aside class="right-panel">
           <div class="inspector-tabs" role="tablist">
@@ -709,7 +819,8 @@ export default function App() {
           }} />}
           {inspectorTab === 'versions' && <VersionsPanel state={state} onSnapshot={() => recordVersion()} onRestore={(version) => {
             const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
-            restore(restored);
+            // 归一化版面字段并重算转写、分页，保证旧版本快照也能在当前版面下打开
+            restore(analyzeProject(restored));
           }} />}
         </aside>
       </div>

@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import LayoutPreview from './layout-preview';
+import { computeLayout, downgradeAffectedLines, paginateProject } from './pagination';
+import type { PaginationSettings } from './types';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import type { HistoryState, LinePaginationOverride, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -55,7 +58,7 @@ function loadInitialState(): ProjectState {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as ProjectState;
-      return analyzeProject(parsed);
+      return paginateProject(analyzeProject(parsed));
     }
   } catch {
     // 清除损坏草稿并使用内置示例。
@@ -85,6 +88,10 @@ function useProject() {
 
 function formatTime(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', month: '2-digit', day: '2-digit' }).format(new Date(value));
+}
+
+function emptyLine(): TextbookLine {
+  return { id: `line-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false };
 }
 
 function issueLabel(issue: ProofIssue): string {
@@ -220,6 +227,8 @@ function LineCard({
   onNote,
   onStatus,
   onDelete,
+  onMove,
+  paginationHint,
 }: {
   line: TextbookLine;
   index: number;
@@ -230,6 +239,8 @@ function LineCard({
   onNote: (note: string) => void;
   onStatus: (status: TextbookLine['status']) => void;
   onDelete: () => void;
+  onMove: (direction: -1 | 1) => void;
+  paginationHint?: string;
 }) {
   const unresolved = issues.filter((issue) => !issue.resolved);
   const lineIssues = unresolved.filter((issue) => issue.lineId === line.id);
@@ -250,6 +261,8 @@ function LineCard({
             onInput={(event) => onChange((event.currentTarget as HTMLTextAreaElement).value)}
           />
           <div class="line-actions">
+            <md-icon-button aria-label="上移一行" title="上移一行（行序变化后受影响的已批准行回到待核对）" onClick={(event: MouseEvent) => { event.stopPropagation(); onMove(-1); }}>↑</md-icon-button>
+            <md-icon-button aria-label="下移一行" title="下移一行" onClick={(event: MouseEvent) => { event.stopPropagation(); onMove(1); }}>↓</md-icon-button>
             <md-icon-button aria-label="标记待核对" title="标记待核对" onClick={(event: MouseEvent) => { event.stopPropagation(); onStatus('questionable'); }}>?</md-icon-button>
             <md-icon-button aria-label="标记已校对" title="标记已校对" onClick={(event: MouseEvent) => { event.stopPropagation(); onStatus('reviewed'); }}>✓</md-icon-button>
             <md-icon-button aria-label="批准此行" title="批准此行" onClick={(event: MouseEvent) => { event.stopPropagation(); onStatus('approved'); }}>★</md-icon-button>
@@ -277,6 +290,7 @@ function LineCard({
             ))}
           </div>
         )}
+        {paginationHint && <div class="line-warnings"><span class="issue-chip info">排版 · {paginationHint}</span></div>}
         {selected && (
           <md-outlined-text-field
             class="note-field"
@@ -292,24 +306,42 @@ function LineCard({
 
 function EditorPanel({
   state,
+  view,
+  layout,
+  onViewChange,
   onSelectLine,
   onChangeLine,
+  onMoveLine,
   onNote,
   onStatus,
   onDelete,
   onAddLine,
   onSplitLongLines,
   onImport,
+  onPaginationSettings,
+  onSetBreak,
+  onToggleForcePage,
+  onResetPagination,
+  onPrint,
 }: {
   state: ProjectState;
-  onSelectLine: (id: string) => void;
+  view: 'proof' | 'layout';
+  layout: ReturnType<typeof computeLayout>;
+  onViewChange: (view: 'proof' | 'layout') => void;
+  onSelectLine: (id: string, scroll?: boolean) => void;
   onChangeLine: (id: string, source: string) => void;
+  onMoveLine: (id: string, direction: -1 | 1) => void;
   onNote: (id: string, note: string) => void;
   onStatus: (id: string, status: TextbookLine['status']) => void;
   onDelete: (id: string) => void;
   onAddLine: () => void;
   onSplitLongLines: () => void;
   onImport: (text: string) => void;
+  onPaginationSettings: (settings: PaginationSettings) => void;
+  onSetBreak: (lineId: string, fragmentIndex: number, position: number | null) => void;
+  onToggleForcePage: (lineId: string, force: boolean) => void;
+  onResetPagination: () => void;
+  onPrint: () => void;
 }) {
   const [showImport, setShowImport] = useState(false);
   const [importText, setImportText] = useState('');
@@ -320,12 +352,18 @@ function EditorPanel({
         <div>
           <span class="eyebrow">逐行校对</span>
           <h1>{state.title}</h1>
-          <p>{state.author} · {state.lines.length} 行 · {brailleCellCount(state)} 格</p>
+          <p>{state.author} · {state.lines.length} 行 · {brailleCellCount(state)} 格 · 排版 {layout.pages.length} 页</p>
         </div>
-        <div class="toolbar-actions">
-          <md-outlined-button onClick={() => setShowImport((value) => !value)}>导入课文</md-outlined-button>
-          <md-outlined-button onClick={onSplitLongLines}>按句拆分</md-outlined-button>
-          <md-filled-button onClick={onAddLine}>新增行</md-filled-button>
+        <div class="toolbar-stack">
+          <div class="view-tabs" role="tablist">
+            <button class={view === 'proof' ? 'active' : ''} onClick={() => onViewChange('proof')}>逐行校对</button>
+            <button class={view === 'layout' ? 'active' : ''} onClick={() => onViewChange('layout')}>排版预览 {layout.pages.length > 0 && <span>{layout.pages.length}</span>}</button>
+          </div>
+          <div class="toolbar-actions">
+            <md-outlined-button onClick={() => setShowImport((value) => !value)}>导入课文</md-outlined-button>
+            <md-outlined-button onClick={onSplitLongLines}>按句拆分</md-outlined-button>
+            <md-filled-button onClick={onAddLine}>新增行</md-filled-button>
+          </div>
         </div>
       </div>
 
@@ -354,22 +392,47 @@ function EditorPanel({
         </div>
       )}
 
-      <div class="line-list scroll-pane">
-        {state.lines.map((line, index) => (
-          <LineCard
-            key={line.id}
-            line={line}
-            index={index}
-            selected={state.selectedLineId === line.id}
-            issues={state.issues}
-            onSelect={() => onSelectLine(line.id)}
-            onChange={(source) => onChangeLine(line.id, source)}
-            onNote={(note) => onNote(line.id, note)}
-            onStatus={(status) => onStatus(line.id, status)}
-            onDelete={() => onDelete(line.id)}
-          />
-        ))}
-      </div>
+      {view === 'proof' ? (
+        <div class="line-list scroll-pane">
+          {state.lines.map((line, index) => {
+            const meta = layout.lineMeta.get(line.id);
+            const rowCount = (meta?.effectiveBreaks.length ?? 0) + 1;
+            const uniquePages = meta ? [...new Set(meta.pages)].map((page) => page + 1) : [];
+            const hint = uniquePages.length > 1
+              ? `跨 ${uniquePages.length} 页（第 ${uniquePages.join('、')} 页）· ${rowCount} 个印刷行`
+              : rowCount > 1
+                ? `${rowCount} 个印刷行`
+                : '';
+            return (
+            <LineCard
+              key={line.id}
+              line={line}
+              index={index}
+              selected={state.selectedLineId === line.id}
+              issues={state.issues}
+              onSelect={() => onSelectLine(line.id)}
+              onChange={(source) => onChangeLine(line.id, source)}
+              onNote={(note) => onNote(line.id, note)}
+              onStatus={(status) => onStatus(line.id, status)}
+              onDelete={() => onDelete(line.id)}
+              onMove={(direction) => onMoveLine(line.id, direction)}
+              paginationHint={hint}
+            />
+            );
+          })}
+        </div>
+      ) : (
+        <LayoutPreview
+          state={state}
+          layout={layout}
+          onSettings={onPaginationSettings}
+          onSetBreak={onSetBreak}
+          onToggleForcePage={onToggleForcePage}
+          onResetOverrides={onResetPagination}
+          onJumpLine={(lineId) => onSelectLine(lineId, true)}
+          onPrint={onPrint}
+        />
+      )}
     </main>
   );
 }
@@ -482,8 +545,18 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
   const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [editorView, setEditorView] = useState<'proof' | 'layout'>('proof');
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
+
+  /** 原文/规则/行序变化：重转录、重分页，并把受影响的已批准行打回待核对。 */
+  const reanalyze = (current: ProjectState, update: (draft: ProjectState) => ProjectState): ProjectState => {
+    const updated = update(current);
+    const analyzed = analyzeProject(updated);
+    return paginateProject(downgradeAffectedLines(analyzed, current));
+  };
+
+  const layout = useMemo(() => computeLayout(state), [state]);
 
   const activeRuleSet = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
   const unresolvedCount = state.issues.filter((issue) => !issue.resolved).length;
@@ -492,11 +565,16 @@ export default function App() {
 
   const selectLine = (lineId: string, scroll = false) => {
     commit('切换当前行', (current) => ({ ...current, selectedLineId: lineId }));
-    if (scroll) requestAnimationFrame(() => document.querySelector(`#line-card-${lineId}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }));
+    if (scroll) {
+      requestAnimationFrame(() => {
+        document.querySelector(`#line-card-${lineId}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        document.querySelector(`#layout-row-${lineId}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      });
+    }
   };
 
   const changeLine = (lineId: string, source: string) => {
-    commit('修改课文原文', (current) => analyzeProject({ ...current, lines: current.lines.map((line) => line.id === lineId ? { ...line, source } : line) }));
+    commit('修改课文原文', (current) => reanalyze(current, (draft) => ({ ...draft, lines: draft.lines.map((line) => line.id === lineId ? { ...line, source } : line) })));
   };
 
   const changeStatus = (lineId: string, status: TextbookLine['status']) => {
@@ -576,27 +654,79 @@ export default function App() {
   const exportPrint = () => {
     const printWindow = window.open('', '_blank', 'width=900,height=1100');
     if (!printWindow) return;
-    const rows = state.lines.map((line, index) => `
-      <tr><td>${index + 1}</td><td>${line.source.replace(/[<>&]/g, (char) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[char] ?? char))}</td><td class="braille">${line.tokens.map((token) => token.braille).join('')}</td></tr>
-    `).join('');
-    printWindow.document.write(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${state.title}</title><style>body{font-family:Georgia,serif;color:#111;margin:36px}h1{font-size:22px}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #bbb;text-align:left;vertical-align:top}td:first-child{width:36px;color:#666}.braille{font-family:"Apple Braille",sans-serif;font-size:24px}@media print{body{margin:16mm}}</style></head><body><h1>${state.title}</h1><p>${state.author} · ${activeRuleSet.name} · ${new Date().toLocaleDateString('zh-CN')}</p><table><thead><tr><th>#</th><th>原文</th><th>盲文校对稿</th></tr></thead><tbody>${rows}</tbody></table><script>window.onload=()=>setTimeout(()=>window.print(),150)</script></body></html>`);
+    printWindow.document.write(buildPrintHtml(state, layout));
     printWindow.document.close();
   };
 
-  const updateRule = (ruleId: string, patch: Record<string, unknown>) => {
-    commit('修改转录规则', (current) => {
-      const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
-      const nextSet = updateRuleInSet(ruleSet, ruleId, patch);
-      return analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === nextSet.id ? nextSet : set) });
+  const updatePaginationSettings = (pagination: PaginationSettings) => {
+    commit('调整版心（每行格数/每页行数）', (current) => paginateProject({ ...current, pagination }));
+  };
+
+  const updateLineOverride = (lineId: string, patch: Partial<LinePaginationOverride>) => {
+    commit('调整分页', (current) => {
+      const previous = current.paginationOverrides[lineId] ?? {};
+      const merged: LinePaginationOverride = {
+        breaks: 'breaks' in patch ? patch.breaks : previous.breaks,
+        forcePageBefore: 'forcePageBefore' in patch ? patch.forcePageBefore : previous.forcePageBefore,
+      };
+      const overrides = { ...current.paginationOverrides };
+      if ((!merged.breaks || merged.breaks.length === 0) && !merged.forcePageBefore) {
+        delete overrides[lineId];
+      } else {
+        overrides[lineId] = merged;
+      }
+      return paginateProject({ ...current, paginationOverrides: overrides });
     });
   };
 
-  const batchFixRule = (ruleId: string) => {
-    commit('批量修正同类问题', (current) => {
-      const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
-      const nextSet = updateRuleInSet(ruleSet, ruleId, { enabled: false });
-      return analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === nextSet.id ? nextSet : set) });
+  /**
+   * fragmentIndex 对应该段序号（>=1），其起点即当前断点位置。
+   * 教师首次调整时以当前生效断点为基线接管该行；之后移动即替换该断点；
+   * 恢复自动则清除整行断点覆盖。
+   */
+  const setBreak = (lineId: string, fragmentIndex: number, position: number | null) => {
+    const meta = layout.lineMeta.get(lineId);
+    if (!meta) return;
+    const current = meta.effectiveBreaks[fragmentIndex - 1];
+    if (current == null) return;
+    if (position == null) {
+      updateLineOverride(lineId, { breaks: undefined });
+      return;
+    }
+    const baseline = meta.manualMode ? meta.effectiveBreaks : meta.autoBreaks;
+    const breaks = baseline.map((value) => (value === current ? position : value));
+    updateLineOverride(lineId, { breaks });
+  };
+
+  const resetPaginationOverrides = () => {
+    commit('清除全部手动分页调整', (current) => paginateProject({ ...current, paginationOverrides: {} }));
+  };
+
+  const moveLine = (lineId: string, direction: -1 | 1) => {
+    commit('调整行序', (current) => {
+      const index = current.lines.findIndex((line) => line.id === lineId);
+      const target = index + direction;
+      if (index < 0 || target < 0 || target >= current.lines.length) return current;
+      const lines = [...current.lines];
+      [lines[index], lines[target]] = [lines[target], lines[index]];
+      return reanalyze(current, (draft) => ({ ...draft, lines }));
     });
+  };
+
+  const updateRule = (ruleId: string, patch: Record<string, unknown>) => {
+    commit('修改转录规则', (current) => reanalyze(current, (draft) => {
+      const ruleSet = draft.ruleSets.find((set) => set.id === draft.activeRuleSetId) ?? draft.ruleSets[0];
+      const nextSet = updateRuleInSet(ruleSet, ruleId, patch);
+      return { ...draft, ruleSets: draft.ruleSets.map((set) => set.id === nextSet.id ? nextSet : set) };
+    }));
+  };
+
+  const batchFixRule = (ruleId: string) => {
+    commit('批量修正同类问题', (current) => reanalyze(current, (draft) => {
+      const ruleSet = draft.ruleSets.find((set) => set.id === draft.activeRuleSetId) ?? draft.ruleSets[0];
+      const nextSet = updateRuleInSet(ruleSet, ruleId, { enabled: false });
+      return { ...draft, ruleSets: draft.ruleSets.map((set) => set.id === nextSet.id ? nextSet : set) };
+    }));
   };
 
   const importCourse = (text: string) => {
@@ -605,12 +735,12 @@ export default function App() {
       .split(/\n+|(?<=[.!?。！？])\s+/)
       .map((line) => line.trim())
       .filter(Boolean);
-    commit('导入课文', (current) => analyzeProject({
+    commit('导入课文', (current) => reanalyze(current, () => ({
       ...current,
-      lines: sourceLines.map((source, index) => ({ id: `line-import-${Date.now()}-${index}`, source, tokens: [], status: index === 0 ? 'questionable' : 'unchecked', note: index === 0 ? '导入后待确认规则集。' : '', continuesPrevious: false, continuesNext: false })),
+      lines: sourceLines.map((source, index) => ({ id: `line-import-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`, source, tokens: [], status: index === 0 ? 'questionable' : 'unchecked', note: index === 0 ? '导入后待确认规则集。' : '', continuesPrevious: false, continuesNext: false })),
       selectedLineId: '',
       issues: [],
-    }));
+    })));
   };
 
   return (
@@ -647,43 +777,52 @@ export default function App() {
       <div class="workspace-grid">
         <RuleSetPanel
           state={state}
-          onSelect={(id) => commit('切换规则集并重新检查', (current) => analyzeProject({ ...current, activeRuleSetId: id, issues: [] }))}
+          onSelect={(id) => commit('切换规则集并重新检查', (current) => reanalyze(current, (draft) => ({ ...draft, activeRuleSetId: id, issues: [] })))}
           onUpdateRule={updateRule}
           onToggleContractions={() => {
             const ruleSet = activeRuleSet;
-            commit('切换缩写规则', (current) => analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === ruleSet.id ? { ...set, contractions: !set.contractions } : set) }));
+            commit('切换缩写规则', (current) => reanalyze(current, (draft) => ({ ...draft, ruleSets: draft.ruleSets.map((set) => set.id === ruleSet.id ? { ...set, contractions: !set.contractions } : set) })));
           }}
           onAddRule={(source, output, suspicious) => {
-            commit('新增转写规则', (current) => analyzeProject({
-              ...current,
-              ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: [...set.rules, makeRule(source, output, suspicious)] } : set),
-            }));
+            commit('新增转写规则', (current) => reanalyze(current, (draft) => ({
+              ...draft,
+              ruleSets: draft.ruleSets.map((set) => set.id === draft.activeRuleSetId ? { ...set, rules: [...set.rules, makeRule(source, output, suspicious)] } : set),
+            })));
           }}
-          onRecheck={() => commit('重新检查全部内容', analyzeProject)}
+          onRecheck={() => commit('重新检查全部内容', (current) => paginateProject(analyzeProject(current)))}
         />
 
         <EditorPanel
           state={state}
+          view={editorView}
+          layout={layout}
+          onViewChange={setEditorView}
           onSelectLine={selectLine}
           onChangeLine={changeLine}
+          onMoveLine={moveLine}
           onNote={(lineId, note) => commit('添加校对备注', (current) => ({ ...current, lines: current.lines.map((line) => line.id === lineId ? { ...line, note } : line) }))}
           onStatus={changeStatus}
-          onDelete={(lineId) => commit('删除课文行', (current) => {
-            const lines = current.lines.filter((line) => line.id !== lineId);
-            return analyzeProject({ ...current, lines: lines.length ? lines : [{ id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false }], selectedLineId: lines[0]?.id ?? '' });
-          })}
-          onAddLine={() => commit('新增课文行', (current) => {
-            const line: TextbookLine = { id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false };
-            return analyzeProject({ ...current, lines: [...current.lines, line], selectedLineId: line.id });
-          })}
-          onSplitLongLines={() => commit('按句拆分长行', (current) => {
-            const lines = current.lines.flatMap((line) => line.source
+          onDelete={(lineId) => commit('删除课文行', (current) => reanalyze(current, (draft) => {
+            const lines = draft.lines.filter((line) => line.id !== lineId);
+            return { ...draft, lines: lines.length ? lines : [emptyLine()], selectedLineId: lines[0]?.id ?? '' };
+          }))}
+          onAddLine={() => commit('新增课文行', (current) => reanalyze(current, (draft) => {
+            const line = emptyLine();
+            return { ...draft, lines: [...draft.lines, line], selectedLineId: line.id };
+          }))}
+          onSplitLongLines={() => commit('按句拆分长行', (current) => reanalyze(current, (draft) => ({
+            ...draft,
+            lines: draft.lines.flatMap((line) => line.source
               .split(/(?<=[.!?。！？])\s+|;\s*/)
               .filter((part) => part.trim())
-              .map((source, index) => ({ ...line, id: index === 0 ? line.id : `line-split-${Date.now()}-${index}`, source: source.trim(), tokens: [], note: index === 0 ? line.note : '' })));
-            return analyzeProject({ ...current, lines });
-          })}
+              .map((source, index) => ({ ...line, id: index === 0 ? line.id : `line-split-${Date.now()}-${index}`, source: source.trim(), tokens: [], note: index === 0 ? line.note : '' }))),
+          })))}
           onImport={importCourse}
+          onPaginationSettings={updatePaginationSettings}
+          onSetBreak={setBreak}
+          onToggleForcePage={(lineId, force) => updateLineOverride(lineId, { forcePageBefore: force || undefined })}
+          onResetPagination={resetPaginationOverrides}
+          onPrint={exportPrint}
         />
 
         <aside class="right-panel">
@@ -702,17 +841,75 @@ export default function App() {
             />
           )}
           {inspectorTab === 'rules' && <RuleDetailPanel state={state} onUpdateRule={updateRule} onDeleteRule={(ruleId) => {
-            commit('删除转录规则', (current) => analyzeProject({
-              ...current,
-              ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: set.rules.filter((rule) => rule.id !== ruleId) } : set),
-            }));
+            commit('删除转录规则', (current) => reanalyze(current, (draft) => ({
+              ...draft,
+              ruleSets: draft.ruleSets.map((set) => set.id === draft.activeRuleSetId ? { ...set, rules: set.rules.filter((rule) => rule.id !== ruleId) } : set),
+            })));
           }} />}
           {inspectorTab === 'versions' && <VersionsPanel state={state} onSnapshot={() => recordVersion()} onRestore={(version) => {
-            const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
+            const restored: ProjectState = paginateProject(analyzeProject(cloneState({ ...version.snapshot, versions: state.versions })));
             restore(restored);
           }} />}
         </aside>
       </div>
     </div>
   );
+}
+
+const escapeHtml = (text: string): string => text.replace(/[<>&]/g, (char) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[char] ?? char));
+
+const CONTINUATION_TEXT = (row: { continuesWord: boolean; continuesSourceHyphen: boolean; movedToPage: boolean }): string => {
+  if (row.continuesWord) return '续接上页 · 同词未完';
+  if (row.continuesSourceHyphen) return '续接上页 · 跨行连字符';
+  if (row.movedToPage) return '整行移页 · 自上页移入';
+  return '';
+};
+
+/** 生成与屏幕排版预览一致的 A4 分页打印稿：随当前版心、断点和移页设置输出。 */
+export function buildPrintHtml(state: ProjectState, layout: ReturnType<typeof computeLayout>): string {
+  const { cellsPerLine, linesPerPage } = layout.settings;
+  const date = new Date().toLocaleDateString('zh-CN');
+  const activeRuleSet = state.ruleSets.find((set) => set.id === state.activeRuleSetId) ?? state.ruleSets[0];
+
+  // A4 可用宽 182mm、行区高约 258mm；字号取宽高约束的较小值。
+  const cellMm = 178 / cellsPerLine;
+  const rowMm = 252 / linesPerPage;
+  const fontSizeMm = Math.min(cellMm, rowMm * 0.62).toFixed(2);
+
+  const pagesHtml = layout.pages.map((page) => {
+    const rowsHtml = Array.from({ length: linesPerPage }, (_, rowSlot) => {
+      const row = page.rows[rowSlot];
+      if (!row) return '<div class="print-row"></div>';
+      const banner = row.pageTop ? CONTINUATION_TEXT(row) : '';
+      const text = row.cells.join('').padEnd(cellsPerLine, ' ');
+      const tail = row.endsWithinWord ? '⠤' : '';
+      const tag = `${String(row.lineIndex + 1).padStart(2, '0')}${row.fragmentIndex > 0 ? `.${row.fragmentIndex + 1}` : ''}`;
+      return `<div class="print-row${row.overflow ? ' overflow' : ''}">${banner ? `<span class="print-banner">${escapeHtml(banner)}</span>` : ''}<span class="print-tag">${tag}</span><span class="print-braille">${escapeHtml(text)}${tail}</span></div>`;
+    }).join('');
+
+    return `<section class="sheet">
+      <header><div>${escapeHtml(state.title)}</div><small>${escapeHtml(state.author)} · ${escapeHtml(activeRuleSet.name)} · ${date}</small></header>
+      <div class="print-rows">${rowsHtml}</div>
+      <footer>— ${page.index + 1} —</footer>
+    </section>`;
+  }).join('');
+
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${escapeHtml(state.title)} · 打印版</title>
+<style>
+@page { size: A4; margin: 0; }
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; color: #111; }
+.sheet { width: 210mm; height: 297mm; padding: 10mm 16mm 9mm; display: flex; flex-direction: column; page-break-after: always; position: relative; }
+.sheet:last-child { page-break-after: auto; }
+.sheet header { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #999; padding-bottom: 3mm; margin-bottom: 4mm; font: 600 12pt Georgia, serif; }
+.sheet header small { font: 9pt sans-serif; color: #555; }
+.print-rows { flex: 1; display: flex; flex-direction: column; }
+.print-row { flex: 1; min-height: 0; display: flex; align-items: center; position: relative; border-bottom: 1px dotted #e2e2e2; }
+.print-tag { width: 11mm; color: #888; font: 8pt monospace; flex-shrink: 0; }
+.print-braille { font-family: "Apple Braille", "Segoe UI Symbol", "Noto Sans Symbols 2", sans-serif; font-size: ${fontSizeMm}mm; line-height: 1; letter-spacing: 0; white-space: pre; }
+.print-row.overflow .print-braille { color: #b3261e; }
+.print-banner { position: absolute; top: -3.4mm; left: 11mm; font: 7pt sans-serif; color: #7a4700; background: #fff3df; border: 1px solid #e3c28a; border-radius: 3px; padding: 0 2mm; }
+.sheet footer { text-align: center; color: #777; font: 9pt serif; padding-top: 2mm; }
+@media screen { body { background: #e7eeeb; } .sheet { margin: 10mm auto; background: #fff; box-shadow: 0 4px 18px rgba(0,0,0,.18); } }
+</style></head><body>${pagesHtml}<script>window.onload=()=>setTimeout(()=>window.print(),200)</script></body></html>`;
 }

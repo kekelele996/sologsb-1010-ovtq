@@ -195,7 +195,7 @@ function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: T
 
   if (issues.some((item) => item.severity === 'error')) {
     nextLine.status = 'questionable';
-  } else if (issues.length > 0 && nextLine.status === 'unchecked') {
+  } else if (issues.length > 0 && (nextLine.status === 'unchecked' || nextLine.status === 'questionable')) {
     nextLine.status = 'questionable';
   }
 

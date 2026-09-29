@@ -60,6 +60,23 @@ export interface VersionSnapshot {
   snapshot: Omit<ProjectState, 'versions'>;
 }
 
+export interface PaginationSettings {
+  /** 每行盲文格数 */
+  cellsPerLine: number;
+  /** 每页行数 */
+  linesPerPage: number;
+}
+
+export interface LinePaginationOverride {
+  /**
+   * 手动断点（按该行盲文格的绝对位置，下标对应自动分段序号）。
+   * 仅存储与自动分页不同的断点；重算后越界的断点会被自动忽略。
+   */
+  breaks?: (number | null)[];
+  /** 强制把整行移到下一页页首 */
+  forcePageBefore?: boolean;
+}
+
 export interface ProjectState {
   id: string;
   title: string;
@@ -70,6 +87,8 @@ export interface ProjectState {
   selectedLineId: string;
   issues: ProofIssue[];
   versions: VersionSnapshot[];
+  pagination: PaginationSettings;
+  paginationOverrides: Record<string, LinePaginationOverride>;
   lastCheckedAt: string;
   updatedAt: string;
 }

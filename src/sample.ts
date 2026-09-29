@@ -1,4 +1,5 @@
 import { analyzeProject } from './braille';
+import { paginateProject } from './pagination';
 import type { ProjectState, RuleSet, TranscriptionRule } from './types';
 
 const letters = 'abcdefghijklmnopqrstuvwxyz'.split('').map<TranscriptionRule>((letter, index) => ({
@@ -89,10 +90,12 @@ const base: ProjectState = {
   ],
   issues: [],
   versions: [],
+  pagination: { cellsPerLine: 22, linesPerPage: 18 },
+  paginationOverrides: {},
   lastCheckedAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
 };
 
 export function createInitialProject(): ProjectState {
-  return analyzeProject(base);
+  return paginateProject(analyzeProject(base));
 }
